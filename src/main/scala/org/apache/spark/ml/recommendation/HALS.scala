@@ -17,7 +17,6 @@
 
 package org.apache.spark.ml.recommendation
 
-import org.apache.spark.HashPartitioner
 import org.apache.spark.annotation.{DeveloperApi, Since}
 import org.apache.spark.internal.Logging
 import org.apache.spark.ml.param._
@@ -327,32 +326,6 @@ object HALS extends DefaultParamsReadable[HALS] with Logging {
     }
   }
 
-  /**
-   * :: DeveloperApi ::
-   * Implementation of the ALS algorithm.
-   *
-   * This implementation of the ALS factorization algorithm partitions the two sets of factors among
-   * Spark workers so as to reduce network communication by only sending one copy of each factor
-   * vector to each Spark worker on each iteration, and only if needed.  This is achieved by
-   * precomputing some information about the ratings matrix to determine which users require which
-   * item factors and vice versa.  See the Scaladoc for `InBlock` for a detailed explanation of how
-   * the precomputation is done.
-   *
-   * In addition, since each iteration of calculating the factor matrices depends on the known
-   * ratings, which are spread across Spark partitions, a naive implementation would incur
-   * significant network communication overhead between Spark workers, as the ratings RDD would be
-   * repeatedly shuffled during each iteration.  This implementation reduces that overhead by
-   * performing the shuffling operation up front, precomputing each partition's ratings dependencies
-   * and duplicating those values to the appropriate workers before starting iterations to solve for
-   * the factor matrices.  See the Scaladoc for `OutBlock` for a detailed explanation of how the
-   * precomputation is done.
-   *
-   * Note that the term "rating block" is a bit of a misnomer, as the ratings are not partitioned by
-   * contiguous blocks from the ratings matrix but by a hash function on the rating's location in
-   * the matrix.  If it helps you to visualize the partitions, it is easier to think of the term
-   * "block" as referring to a subset of an RDD containing the ratings rather than a contiguous
-   * submatrix of the ratings matrix.
-   */
   @DeveloperApi
   def train[ID: ClassTag]( // scalastyle:ignore
                            ratings: RDD[Rating[ID]],
@@ -376,12 +349,15 @@ object HALS extends DefaultParamsReadable[HALS] with Logging {
 
     val (colRaitings, rowRaitings) =
       partitionRatings(ratings, partitions, intermediateRDDStorageLevel)
+    System.out.println("Data partitioned\n")
     val seedGen = new XORShiftRandom(seed)
     val (userFactors, itemFactors) =
       initializeFactors(colRaitings, rowRaitings, rank, seedGen.nextLong())
+    System.out.println("Factors initialized\n")
 
     var tolU, tolI = 0.0
     for (k <- 1 to maxIter) {
+      System.out.println("Iter " + k + "\n")
       computeFactors(colRaitings, itemFactors, userFactors, rank, maxInternIter, tolI)
       normalizeFactors(itemFactors, userFactors, rank)
       computeFactors(rowRaitings, userFactors, itemFactors, rank, maxInternIter, tolU)
@@ -402,12 +378,12 @@ object HALS extends DefaultParamsReadable[HALS] with Logging {
   : (RDD[(ID, Iterable[(ID, Float)])], RDD[((ID, Iterable[(ID, Float)]))]) = {
     val colRatings = ratings.
       mapPartitions(iter => iter.map( u => ( u.item, (u.user, u.rating)) ) ).
-      groupByKey(new HashPartitioner(partitions)).
+      groupByKey(/*new HashPartitioner(partitions)*/).
       persist(intermediateRDDStorageLevel)
 
     val rowRatings = ratings.
       mapPartitions(iter => iter.map( u => ( u.user, (u.item, u.rating)) ) ).
-      groupByKey(new HashPartitioner(partitions)).
+      groupByKey(/*new HashPartitioner(partitions)*/).
       persist(intermediateRDDStorageLevel)
 
     (colRatings, rowRatings)
@@ -418,17 +394,26 @@ object HALS extends DefaultParamsReadable[HALS] with Logging {
                                               rank: Int,
                                               seed: Long = 0L)(implicit ord: Ordering[ID])
   : (Map[ID, Array[Float]], Map[ID, Array[Float]]) = {
-    (SortedMap(
-       rowRatings.keys.map(k => {
-         val random = new XORShiftRandom(byteswap64(seed^k.hashCode() + rowRatings.hashCode()))
-         (k, Array.fill(rank)(math.max(0, random.nextGaussian().toFloat)))
-       }).collect(): _*),
-     SortedMap(
-       colRatings.keys.map(k => {
-         val random = new XORShiftRandom(byteswap64(seed^k.hashCode() + colRatings.hashCode()))
-         (k, Array.fill(rank)(math.max(0, random.nextGaussian().toFloat)))
-       }).collect(): _*)
-    )
+    val rowFactors = rowRatings.map(q => {
+      val (k, _) = q
+      val random = new XORShiftRandom(byteswap64(seed ^ k.hashCode() + rowRatings.hashCode()))
+      val factor = Array.fill(rank)(math.max(0.0f, random.nextGaussian().toFloat))
+      //val nrm = blas.snrm2(rank, factor, 1)
+      //blas.sscal(rank, 1.0f / nrm, factor, 1)
+      (k, factor)
+    }).collect()
+    System.out.println("Calculated factors: " + rowFactors.length)
+    val colFactors = colRatings.map(q => {
+      val (k, _) = q
+      val random = new XORShiftRandom(byteswap64(seed ^ k.hashCode() + rowRatings.hashCode()))
+      val factor = Array.fill(rank)(math.max(0.0f, random.nextGaussian().toFloat))
+      //val nrm = blas.snrm2(rank, factor, 1)
+      //blas.sscal(rank, 1.0f / nrm, factor, 1)
+      (k, factor)
+    }).collect()
+    System.out.println("Calculated factors: " + colFactors.length)
+
+    (SortedMap(rowFactors.toSeq: _*),SortedMap(colFactors.toSeq: _*))
   }
 
   private def computeB[ID: ClassTag](factors: Map[ID, Array[Float]], rank: Int): Matrix = {
@@ -504,8 +489,11 @@ object HALS extends DefaultParamsReadable[HALS] with Logging {
                                            maxInternIter: Int,
                                            tol: Double
                                           ): Unit = {
+    val broadcast = ratings.sparkContext.broadcast(constFactors)
     val b = computeB(constFactors, rank)
     val c = computeC(ratings, constFactors, rank)
+    broadcast.unpersist()
+    broadcast.destroy()
 
     for (k <- 1 to maxInternIter) {
       for (j <- 0 until rank) {
